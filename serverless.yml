@@ -1,0 +1,133 @@
+service: hybrid-rag
+frameworkVersion: "4"
+
+plugins:
+  - serverless-localstack
+
+provider:
+  name: aws
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'local'}
+  ecr:
+    images:
+      application:
+        path: .
+  environment:
+    AWS_REGION: ${self:provider.region}
+    DOCUMENT_BUCKET:
+      Ref: DocumentBucket
+    DOCUMENTS_TABLE:
+      Ref: DocumentsTable
+    RAG_TABLE:
+      Ref: RagTable
+    SQS_QUEUE_URL:
+      Ref: IngestionQueue
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action: [s3:GetObject, s3:PutObject]
+          Resource:
+            - Fn::Join: ["", ["arn:aws:s3:::", { Ref: DocumentBucket }, "/*"]]
+        - Effect: Allow
+          Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan, dynamodb:DeleteItem, dynamodb:BatchWriteItem]
+          Resource:
+            - Fn::GetAtt: [DocumentsTable, Arn]
+            - Fn::GetAtt: [RagTable, Arn]
+
+functions:
+  api:
+    image:
+      name: application
+      command: [handlers.api_handler]
+    memorySize: 2048
+    timeout: 30
+    events:
+      - httpApi: "GET /health"
+      - httpApi: "POST /documents/upload-url"
+      - httpApi: "GET /documents/{document_id}"
+      - httpApi: "POST /queries"
+  ingest:
+    image:
+      name: application
+      command: [workers.sqs_worker.handler]
+    memorySize: 4096
+    timeout: 300
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [IngestionQueue, Arn]
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+
+custom:
+  localstack:
+    stages: [local]
+
+resources:
+  Resources:
+    DocumentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: document_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: document_id
+            KeyType: HASH
+    RagTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: parent_id
+            AttributeType: S
+          - AttributeName: record_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: parent_id
+            KeyType: HASH
+          - AttributeName: record_id
+            KeyType: RANGE
+    IngestionDeadLetterQueue:
+      Type: AWS::SQS::Queue
+    IngestionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 360
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [IngestionDeadLetterQueue, Arn]
+          maxReceiveCount: 3
+    DocumentBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: uploads/
+              Queue:
+                Fn::GetAtt: [IngestionQueue, Arn]
+    IngestionQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: IngestionQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: s3.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt: [IngestionQueue, Arn]
+              Condition:
+                StringEquals:
+                  aws:SourceAccount:
+                    Ref: AWS::AccountId

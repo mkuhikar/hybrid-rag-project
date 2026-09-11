@@ -1,6 +1,11 @@
 boto3
-fastapi
 groq
 numpy
+pydantic
 sentence-transformers
-uvicorn[standard]
+streamlit
+pypdf
+python-docx
+openpyxl
+python-pptx
+pandas

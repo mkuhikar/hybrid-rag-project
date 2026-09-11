@@ -1,30 +1,54 @@
-"""Document lifecycle persistence for the local development deployment."""
+"""DynamoDB-backed document lifecycle persistence for Lambda handlers."""
 
-import sqlite3
-from pathlib import Path
+from datetime import datetime, timezone
+
+import boto3
+
+from core.config import Settings
 
 
 class DocumentRepository:
     """Persist ingestion state independently of the RAG vector index."""
 
-    def __init__(self, database_path: str):
-        Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-        self.database_path = database_path
-        with self._connect() as connection:
-            connection.execute("""CREATE TABLE IF NOT EXISTS documents (document_id TEXT PRIMARY KEY, object_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, error_message TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
-
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.database_path)
+    def __init__(self, settings: Settings):
+        if not settings.documents_table:
+            raise ValueError("DOCUMENTS_TABLE must be configured")
+        self.table = boto3.resource(
+            "dynamodb",
+            region_name=settings.aws_region,
+            endpoint_url=settings.aws_endpoint_url,
+        ).Table(settings.documents_table)
 
     def create(self, document_id: str, object_key: str) -> None:
-        with self._connect() as connection:
-            connection.execute("INSERT INTO documents (document_id, object_key, status) VALUES (?, ?, ?)", (document_id, object_key, "PENDING_UPLOAD"))
+        now = datetime.now(timezone.utc).isoformat()
+        self.table.put_item(
+            Item={
+                "document_id": document_id,
+                "object_key": object_key,
+                "status": "PENDING_UPLOAD",
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
 
     def set_status(self, document_id: str, status: str, error_message: str | None = None) -> None:
-        with self._connect() as connection:
-            connection.execute("UPDATE documents SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?", (status, error_message, document_id))
+        self.table.update_item(
+            Key={"document_id": document_id},
+            UpdateExpression="SET #status = :status, error_message = :error, updated_at = :updated",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":status": status,
+                ":error": error_message,
+                ":updated": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     def get(self, document_id: str) -> dict[str, str | None] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT document_id, status, error_message FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-        return None if row is None else {"document_id": row[0], "status": row[1], "error_message": row[2]}
+        item = self.table.get_item(Key={"document_id": document_id}).get("Item")
+        if item is None:
+            return None
+        return {
+            "document_id": item["document_id"],
+            "status": item["status"],
+            "error_message": item.get("error_message"),
+        }

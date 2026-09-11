@@ -1,16 +1,17 @@
 """Long-lived RAG component used by the API and SQS worker."""
 
 from core.config import Settings
-from db import SQLVectorStore
+from db import DynamoVectorStore
 from rag import HybridRAGPipeline
+from services.storage import S3Storage
 
 
 class RAGService:
     _instance: "RAGService | None" = None
 
     def __init__(self, settings: Settings):
-        self.store = SQLVectorStore(db_path=settings.rag_database_path)
-        self.pipeline = HybridRAGPipeline(self.store)
+        self.store = DynamoVectorStore(settings)
+        self.pipeline = HybridRAGPipeline(self.store, S3Storage(settings))
 
     @classmethod
     def instance(cls, settings: Settings) -> "RAGService":

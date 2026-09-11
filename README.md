@@ -1,5 +1,8 @@
 # Hybrid RAG Project
 
+Project documentation and the prioritized delivery plan are in
+[`docs/PROJECT.md`](docs/PROJECT.md) and [`docs/TODO.md`](docs/TODO.md).
+
 A Python prototype for a hybrid RAG workflow combining dense chunk retrieval,
 ingestion-time Reverse HyDE questions, cross-encoder reranking, and simple RAG
 quality metrics.

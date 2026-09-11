@@ -5,3 +5,4 @@ __pycache__/
 .env
 logs/*.log
 data/*.db
+node_modules

@@ -8,7 +8,8 @@ from groq import Groq
 import numpy as np
 from sentence_transformers import CrossEncoder
 
-from db import ProductionEmbedder, SQLVectorStore
+from db import DynamoVectorStore, ProductionEmbedder
+from services.storage import S3Storage
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,14 +47,15 @@ class RAGTriadEvaluator:
 
 
 class HybridRAGPipeline:
-    def __init__(self, sql_store: SQLVectorStore):
-        self.sql_store = sql_store
+    def __init__(self, vector_store: DynamoVectorStore, storage: S3Storage):
+        self.vector_store = vector_store
+        self.storage = storage
         self.llm_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
         self.reranker = CrossEncoderReranker()
-        self.evaluator = RAGTriadEvaluator(sql_store.embedder)
+        self.evaluator = RAGTriadEvaluator(vector_store.embedder)
 
     def query(self, question: str, top_k_parents: int = 2) -> dict[str, Any]:
-        candidates = self.sql_store.search_all_sources(question)
+        candidates = self.vector_store.search_all_sources(question)
         reranked = self.reranker.rerank(question, candidates)
         parent_ids: list[str] = []
         for item in reranked:
@@ -61,7 +63,10 @@ class HybridRAGPipeline:
                 parent_ids.append(item["parent_id"])
             if len(parent_ids) == top_k_parents:
                 break
-        context = "\n---\n".join(self.sql_store.get_parent_doc(parent_id) for parent_id in parent_ids)
+        context = "\n---\n".join(
+            self.storage.read_text(self.vector_store.get_parent_metadata(parent_id)["object_key"])
+            for parent_id in parent_ids
+        )
         completion = self.llm_client.chat.completions.create(model="openai/gpt-oss-20b", temperature=0.0, messages=[{"role": "system", "content": "Answer only from the supplied context. Say when the context is insufficient."}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}])
         answer = completion.choices[0].message.content or ""
         return {"generated_answer": answer, "matched_candidates": [item["text"] for item in reranked[:top_k_parents]], "rag_triad_scores": {"context_relevance": round(self.evaluator.context_relevance(question, context), 4), "faithfulness": round(self.evaluator.faithfulness(answer, context), 4), "answer_relevance": round(self.evaluator.answer_relevance(question, answer), 4)}}
