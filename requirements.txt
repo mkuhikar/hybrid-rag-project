@@ -9,3 +9,5 @@ python-docx
 openpyxl
 python-pptx
 pandas
+torch
+python-dotenv

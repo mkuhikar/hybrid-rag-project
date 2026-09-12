@@ -1,11 +1,54 @@
-from pdf2image import convert_from_bytes
+
+
+import io
 import pandas as pd
-from pypdf import PdfReader
 import docx
-from pptx import Presentation
-import io, base64
 import streamlit as st
+from pptx import Presentation
 from streamlit_pdf_viewer import pdf_viewer
+from dotenv import load_dotenv
+
+# Load Environment Variables
+load_dotenv()
+
+from utils.document_parsers import parse_uploaded_files, extract_text_from_docx
+from rag.pipeline import HybridRAGPipeline
+from utils.limit_tracker import (
+    load_usage_data,
+    check_upload_allowed,
+    record_upload,
+    check_prompt_allowed,
+    record_prompt,
+    MAX_DAILY_MB,
+    MAX_DAILY_PROMPTS
+)
+def build_index_with_progress(uploaded_files_dict, chunk_size):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    # Step 1: Reading files
+    status_text.text("📄 Reading and parsing documents...")
+    progress_bar.progress(25)
+    parsed_documents = parse_uploaded_files(uploaded_files_dict)
+
+    # Step 2: Preparing text chunks
+    status_text.text("✂️ Splitting content into searchable sections...")
+    progress_bar.progress(50)
+
+    # Step 3: Generating search index (Embeddings & BM25)
+    status_text.text("🧠 Preparing AI search index...")
+    progress_bar.progress(75)
+    pipeline = HybridRAGPipeline(parsed_documents, chunk_words=chunk_size)
+
+    # Step 4: Completion
+    progress_bar.progress(100)
+    status_text.text("✨ Document index ready!")
+    
+    # Clear status indicators after completion
+    progress_bar.empty()
+    status_text.empty()
+    
+    return pipeline
 
 # -----------------------------------------------------------------------------
 # 1. Page Configuration & Layout Setup
@@ -16,7 +59,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize Session State Variables
 if "uploaded_files_dict" not in st.session_state:
     st.session_state.uploaded_files_dict = {}
 
@@ -25,7 +67,9 @@ if "messages" not in st.session_state:
         {"role": "assistant", "content": "Hello! Upload your documents on the left and ask me anything about them."}
     ]
 
-# Header Title
+if "rag_pipeline" not in st.session_state:
+    st.session_state.rag_pipeline = None
+
 st.markdown("## 🧠 DocuChat AI: Interactive Document Assistant")
 st.markdown("---")
 
@@ -35,6 +79,15 @@ st.markdown("---")
 with st.sidebar:
     st.header("Document Upload & Settings")
     
+    # Global Limits Dashboard Banner
+    usage = load_usage_data()
+    used_mb = usage["uploaded_bytes"] / (1024 * 1024)
+    st.info(
+        f"🌐 **Global Daily Demo Limits**\n\n"
+        f"• **Upload Quota:** {used_mb:.2f} / {MAX_DAILY_MB} MB\n\n"
+        f"• **Prompts Used:** {usage['prompt_count']} / {MAX_DAILY_PROMPTS}"
+    )
+
     st.subheader("1. Upload Your Documents")
     uploaded_files = st.file_uploader(
         "Drag and drop or browse files",
@@ -42,12 +95,27 @@ with st.sidebar:
         accept_multiple_files=True
     )
     
-    # Store files in session state dictionary by name
     if uploaded_files:
         for f in uploaded_files:
-            st.session_state.uploaded_files_dict[f.name] = f
+            if f.name not in st.session_state.uploaded_files_dict:
+                file_size = f.size
+                
+                # Check 1: Is this single file alone bigger than the maximum allowed daily cap?
+                if (file_size / (1024 * 1024)) > MAX_DAILY_MB:
+                    st.error(f"❌ '{f.name}' ({file_size / (1024 * 1024):.2f} MB) exceeds maximum allowed daily limit ({MAX_DAILY_MB} MB).")
+                    continue
 
-    # Display Current Files list with delete buttons
+                # Check 2: Does adding this file exceed remaining daily quota?
+                allowed, err_msg = check_upload_allowed(file_size)
+                if not allowed:
+                    st.error(err_msg)
+                    continue
+
+                # File is valid: store and record usage
+                st.session_state.uploaded_files_dict[f.name] = f
+                record_upload(file_size)
+                st.session_state.rag_pipeline = None  # Invalidate index when a new file is added
+
     if st.session_state.uploaded_files_dict:
         st.subheader("Current Files")
         files_to_remove = []
@@ -59,45 +127,61 @@ with st.sidebar:
         
         for name in files_to_remove:
             del st.session_state.uploaded_files_dict[name]
+            st.session_state.rag_pipeline = None
             st.rerun()
 
     st.markdown("---")
     st.subheader("Settings")
-    model_choice = st.selectbox("Model", ["GPT-4o", "GPT-3.5-Turbo", "Claude-3.5-Sonnet"])
-    chunk_size = st.slider("Chunk Size", min_value=100, max_value=2000, value=1000, step=100)
-    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.7, step=0.1)
+    model_choice = st.selectbox("Model", ["GPT", "QWEN", "GROQ"])
+    chunk_size = st.slider(
+        "Chunk Size (words)", 
+        min_value=20, 
+        max_value=500, 
+        value=100,
+        step=10,
+        on_change=lambda: st.session_state.update(rag_pipeline=None)
+    )    
+    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
 
     st.markdown("---")
     st.subheader("Processing Status")
+    
     if st.session_state.uploaded_files_dict:
-        st.success("✔ Index Ready")
+        if st.button("⚡ Build/Rebuild Index", use_container_width=True):
+            st.session_state.rag_pipeline = build_index_with_progress(
+                st.session_state.uploaded_files_dict, 
+                chunk_size
+            )
+            st.success("✔ Index Ready!")
+        elif st.session_state.rag_pipeline is not None:
+            st.success("✔ Index Ready")
+        else:
+            st.warning("⚠️ Index out of date. Click build button above.")
     else:
         st.info("ℹ️ No documents uploaded")
 
 # -----------------------------------------------------------------------------
 # 3. Helper Functions for Document Previewing
 # -----------------------------------------------------------------------------
-
-
-
 def render_pdf(file_obj):
-    binary_data = file_obj.read()
-    
-    # Render with responsive scaling and zero extra padding
+    file_obj.seek(0)
     pdf_viewer(
-        input=binary_data,
-        width="100%",           # Fits automatically to column width
-        height=600,             # Fixed height with inner scrolling
-        pages_to_render=[],     # Render all pages
-        render_text=True        # Ensures sharp text rendering
+        input=file_obj.read(),
+        width="100%",
+        height=600,
+        pages_to_render=[],
+        render_text=True
     )
 
 def render_docx(file_obj):
-    doc = docx.Document(file_obj)
-    full_text = [p.text for p in doc.paragraphs if p.text]
-    st.text_area("Document Content", value="\n\n".join(full_text), height=500)
+    try:
+        text = extract_text_from_docx(file_obj)
+        st.text_area("Document Content", value=text, height=500)
+    except Exception as e:
+        st.error(f"Error loading DOCX file: {str(e)}")
 
 def render_excel(file_obj):
+    file_obj.seek(0)
     excel_file = pd.ExcelFile(file_obj)
     sheet_names = excel_file.sheet_names
     selected_sheet = st.selectbox("Select Sheet", sheet_names)
@@ -117,6 +201,8 @@ def render_pptx(file_obj):
             
     st.text_area(f"Slide {slide_num} Text", value="\n".join(slide_text), height=450)
 
+
+
 # -----------------------------------------------------------------------------
 # 4. Main Panel Split (Viewer | Chat UI)
 # -----------------------------------------------------------------------------
@@ -134,11 +220,8 @@ with col_viewer:
         
         file_obj = st.session_state.uploaded_files_dict[selected_filename]
         file_ext = selected_filename.split(".")[-1].lower()
-        
-        # Reset byte stream position
         file_obj.seek(0)
         
-        # Render appropriate preview based on extension
         if file_ext == "pdf":
             render_pdf(file_obj)
         elif file_ext in ["docx", "doc"]:
@@ -156,33 +239,81 @@ with col_viewer:
 with col_chat:
     st.subheader("Chat Assistant")
     
-    # Container for rendering historical chat messages
     chat_container = st.container(height=500)
     
     with chat_container:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
+                if "metrics" in msg:
+                    st.caption(
+                        f"📊 **Context Relevance:** {msg['metrics']['context_relevance']} | "
+                        f"**Faithfulness:** {msg['metrics']['faithfulness']} | "
+                        f"**Answer Relevance:** {msg['metrics']['answer_relevance']}",
+                        help=(
+                            "**RAG Triad Metrics Explanation:**\n\n"
+                            "• **Context Relevance:** % of query keywords/tokens found in retrieved document contexts.\n"
+                            "• **Faithfulness:** % of claims in the generated response that are strictly entailed by the context.\n"
+                            "• **Answer Relevance:** Cosine similarity % between your question and the model's answer."
+                        )
+                    )
 
-    # Chat input box at the bottom
     if prompt := st.chat_input("Ask a question about your documents..."):
-        # Add user prompt to history
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        prompt_allowed, prompt_err = check_prompt_allowed()
         
-        # Immediately display user message in panel
-        with chat_container:
-            with st.chat_message("user"):
-                st.write(prompt)
+        if not prompt_allowed:
+            st.error(prompt_err)
+        else:
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            
+            with chat_container:
+                with st.chat_message("user"):
+                    st.write(prompt)
 
-        # Generate response (Placeholder logic to connect your backend/LLM)
-        with chat_container:
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
+            with chat_container:
+                with st.chat_message("assistant"):
                     if not st.session_state.uploaded_files_dict:
                         response_text = "Please upload at least one document so I can answer questions about it."
+                        st.write(response_text)
+                        st.session_state.messages.append({"role": "assistant", "content": response_text})
                     else:
-                        files_list = ", ".join(st.session_state.uploaded_files_dict.keys())
-                        response_text = f"I am searching through {files_list} using `{model_choice}` to answer your question:\n\n*\"{prompt}\"*"
-                    
-                    st.write(response_text)
-                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                        # Auto-build with progress bar if index wasn't built yet
+                        if st.session_state.rag_pipeline is None:
+                            st.session_state.rag_pipeline = build_index_with_progress(
+                                st.session_state.uploaded_files_dict, 
+                                chunk_size
+                            )
+
+                        # User-friendly search spinner
+                        with st.spinner("🔍 Reading documents & generating response..."):
+                            record_prompt()
+                            
+                            rag_result = st.session_state.rag_pipeline.query(
+                                query_str=prompt,
+                                model_name=model_choice,
+                                temperature=temperature
+                            )
+                            
+                            response_text = rag_result["generated_answer"]
+                            metrics = rag_result["rag_triad_scores"]
+                            
+                            st.write(response_text)
+                            st.caption(
+                                f"📊 **Context Relevance:** {metrics['context_relevance']} | "
+                                f"**Faithfulness:** {metrics['faithfulness']} | "
+                                f"**Answer Relevance:** {metrics['answer_relevance']}",
+                                help=(
+                                    "**RAG Triad Metrics Explanation:**\n\n"
+                                    "• **Context Relevance:** % of query keywords/tokens found in retrieved document contexts.\n"
+                                    "• **Faithfulness:** % of claims in the generated response that are strictly entailed by the context.\n"
+                                    "• **Answer Relevance:** Cosine similarity % between your question and the model's answer."
+                                )
+                            )
+                            
+                            st.session_state.messages.append({
+                                "role": "assistant", 
+                                "content": response_text,
+                                "metrics": metrics
+                            })
+                            st.rerun()
+        
