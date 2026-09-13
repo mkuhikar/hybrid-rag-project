@@ -1,56 +1,165 @@
 # Hybrid RAG Project
 
-Project documentation and the prioritized delivery plan are in
-[`docs/PROJECT.md`](docs/PROJECT.md) and [`docs/TODO.md`](docs/TODO.md).
+A high-performance, modular multi-document Retrieval-Augmented Generation (RAG) system built with **Streamlit**, **SentenceTransformers**, and **Cross-Encoders**. This repository combines dense vector search with sparse BM25 keyword search, reranks results using a Cross-Encoder model, and evaluates response quality using the RAG Triad framework.
 
-A Python prototype for a hybrid RAG workflow combining dense chunk retrieval,
-ingestion-time Reverse HyDE questions, cross-encoder reranking, and simple RAG
-quality metrics.
+![alt text](images/image-1.png)
 
-## Project layout
+---
 
-- `app.py` — FastAPI application entry point.
-- `api/` — upload, document status, and question-answering endpoints.
-- `workers/` — independent SQS ingestion worker.
-- `services/` — S3 and RAG application services.
-- `repositories/` — document lifecycle persistence.
-- `rag.py` — retrieval, reranking, generation, and evaluation pipeline.
-- `db.py` — SQLite vector-store implementation for local development.
-- `data/` — local SQLite databases (ignored by Git).
-- `logs/` — runtime log files (ignored by Git).
-- `scripts/` — operational and maintenance scripts.
-- `tests/` — automated tests.
+## Features
 
-## Setup and run
+* **Hybrid Retrieval System:** Combines sparse BM25 keyword matching with dense vector embeddings (`all-MiniLM-L6-v2`) for higher retrieval recall.
+* **Cross-Encoder Reranking:** Uses `BAAI/bge-reranker-base` to rerank initial retrieved document chunks for maximum context precision.
+* **RAG Triad Evaluation:** Integrated automated evaluation pipeline scoring context relevance, faithfulness (via `cross-encoder/nli-deberta-v3-base`), and answer relevance.
+* **Interactive Streamlit UI:** Side-by-side split layout featuring live document viewing alongside an interactive chat interface.
+* **Multi-Format Parsing & Rate Limiting:** Multi-file parsing utilities (PDF, DOCX, XLSX, PPTX) paired with usage limit tracking.
+* **Docker Support:** Containerized setup for easy local deployment.
 
-Create a virtual environment, install dependencies, and configure environment
-variables before starting either process:
+---
+
+## Repository Structure
+
+```text
+hybrid-rag-project/
+├── .streamlit/           # Streamlit app configuration
+├── .vscode/              # Editor settings
+├── rag/                  # Core RAG engine components
+│   ├── __init__.py
+│   ├── embedder.py       # Dense vector embedder (SentenceTransformer)
+│   ├── evaluator.py      # RAG Triad evaluation metrics (DeBERTa NLI)
+│   ├── pipeline.py       # Main end-to-end RAG workflow orchestration
+│   ├── reranker.py       # Cross-Encoder reranking model
+│   └── retriever.py      # BM25 sparse keyword retriever
+├── tests/                # Unit and integration tests
+│   ├── .gitkeep
+│   └── test_documents.py
+├── utils/                # Helper utilities
+│   ├── __init__.py
+│   ├── document_parsers.py# Extract text from PDF, DOCX, XLSX, PPTX
+│   └── limit_tracker.py  # Rate limiting and usage tracking
+├── .dockerignore
+├── .env / .env.example   # Environment variables configuration
+├── .gitignore
+├── app.py                # Main Streamlit application entry point
+├── Dockerfile            # Container configuration
+├── README.md             # Project documentation
+└── requirements.txt      # Python dependencies
+```
+
+## Architecture Overview
+
+### 1. Document Parsing & Chunking
+**File:** `utils/document_parsers.py`
+
+Converts uploaded user files into clean, structured text chunks suitable for retrieval and downstream processing.
+
+### 2. Dense & Sparse Indexing
+**Files:** `rag/embedder.py`, `rag/retriever.py`
+
+- Encodes document chunks into dense vector embeddings using **all-MiniLM-L6-v2**.
+- Builds a sparse retrieval index using a custom **BM25Retriever** for efficient keyword-based search.
+- Combines semantic and lexical retrieval for improved recall.
+
+### 3. Cross-Encoder Reranking
+**File:** `rag/reranker.py`
+
+Uses **BAAI/bge-reranker-base** to rerank retrieved passages and prioritize the most relevant context before passing it to the LLM.
+
+### 4. RAG Triad Evaluation
+**File:** `rag/evaluator.py`
+
+Evaluates retrieval and generation quality using:
+
+- **Context Relevance** – Measures how relevant retrieved passages are to the user query.
+- **Answer Faithfulness** – Uses **nli-deberta-v3-base** for NLI-based entailment checking to verify that generated answers are supported by retrieved context.
+- **Answer Relevance** – Measures how well the generated answer addresses the original question.
+
+---
+
+# Quickstart Guide
+
+## Option 1: Run Locally
+
+### Clone the Repository
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/your-username/hybrid-rag-project.git
+cd hybrid-rag-project
+```
+
+### Create a Virtual Environment
+
+```bash
+python -m venv venv
+```
+
+Activate the environment:
+
+**Linux / macOS**
+
+```bash
+source venv/bin/activate
+```
+
+**Windows**
+
+```bash
+venv\Scripts\activate
+```
+
+### Install Dependencies
+
+```bash
 pip install -r requirements.txt
-export GROQ_API_KEY="your-key"
-export DOCUMENT_BUCKET="your-upload-bucket"
-export SQS_QUEUE_URL="your-sqs-queue-url"
-uvicorn app:app --reload
 ```
 
-Run the ingestion worker separately:
+### Configure Environment Variables
 
 ```bash
-python -m workers.sqs_worker
+cp .env.example .env
 ```
 
-The browser first requests `POST /documents/upload-url`, uploads directly to
-the returned S3 form, and polls `GET /documents/{document_id}` until the status
-is `READY`. An S3 ObjectCreated notification must be configured to publish to
-the configured SQS queue. Submit questions to `POST /queries`.
+Update the `.env` file with the required API keys and configuration values.
 
-## Logging
+### Launch the Application
 
-The application writes operational events to standard error and to
-`logs/hybrid_rag.log`. Set `LOG_LEVEL` (for example, `DEBUG` or `WARNING`) or
-`LOG_DIR` to change its behavior. Logs deliberately contain only identifiers,
-counts, and text lengths; they do not record document contents, user queries,
-or credentials.
+```bash
+streamlit run app.py
+```
+
+---
+
+## Option 2: Run with Docker
+
+### Build the Docker Image
+
+```bash
+docker build -t hybrid-rag-app .
+```
+
+### Run the Container
+
+```bash
+docker run -p 8501:8501 --env-file .env hybrid-rag-app
+```
+
+The application will be available at:
+
+```text
+http://localhost:8501
+```
+
+---
+
+# Running Tests
+
+Execute unit tests for document parsing and pipeline components:
+
+```bash
+pytest tests/
+```
+
+# Additional Screenshots
+![alt text](images/image-2.png)
+----------------------------------------------------
+![alt text](images/image-3.png)
