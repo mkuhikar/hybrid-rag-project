@@ -12,3 +12,4 @@ pandas
 torch
 python-dotenv
 streamlit_pdf_viewer
+torchvision
